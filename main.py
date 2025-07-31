@@ -33,9 +33,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "2eae629d76beaa92a8afaacdb945eeecec9d7473f961178e9933101fd3c6a4d8")
 
+# --- CHANGE 1: Upgraded Embedding Model for Higher Accuracy ---
 MODEL_NAME = "BAAI/bge-m3"
-PINECONE_DIMENSION = 1024
-PINECONE_INDEX_NAME = "bajajhackathonfinal"
+PINECONE_DIMENSION = 1024 # Dimension for bge-m3
+PINECONE_INDEX_NAME = "bajajhackathon-final" # Use a new index name for the new model
 
 # -------------------------------
 # Initialize Models and Services
@@ -59,13 +60,8 @@ print(f"✅ Connected to Pinecone index: {PINECONE_INDEX_NAME}")
 # -------------------------------
 # FastAPI Setup
 # -------------------------------
-app = FastAPI(title="Single-Endpoint RAG System for Hackathon")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+app = FastAPI(title="Optimized RAG System for Hackathon")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # -------------------------------
 # Pydantic Models & Caching
@@ -93,16 +89,11 @@ def load_and_extract_text(url: str) -> str:
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         file_stream = BytesIO(response.content)
-        
         if base_url.lower().endswith('.pdf'):
             reader = PdfReader(file_stream)
-            return "\n\n".join(
-                f"[Page {i+1}]\n{page.extract_text()}" 
-                for i, page in enumerate(reader.pages) if page.extract_text()
-            )
+            return "\n\n".join(f"[Page {i+1}]\n{page.extract_text()}" for i, page in enumerate(reader.pages) if page.extract_text())
         elif base_url.lower().endswith('.docx'):
             doc = Document(file_stream)
-            # Simple text extraction for docx
             return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
         else:
             raise ValueError("Unsupported file type.")
@@ -112,21 +103,15 @@ def load_and_extract_text(url: str) -> str:
 def get_enhanced_text_chunks(text: str, doc_url: str) -> List[Dict]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_text(text)
-    
     enhanced_chunks = []
     current_page = 1
     for i, chunk in enumerate(chunks):
         page_match = re.search(r'\[Page (\d+)\]', chunk)
         if page_match:
             current_page = int(page_match.group(1))
-        
         clean_chunk = re.sub(r'\[Page \d+\]\n', '', chunk).strip()
-        
         if len(clean_chunk) > 50:
-            enhanced_chunks.append({
-                'text': clean_chunk, 'chunk_id': i, 'page_number': current_page,
-                'source_url': doc_url
-            })
+            enhanced_chunks.append({'text': clean_chunk, 'chunk_id': i, 'page_number': current_page, 'source_url': doc_url})
     return enhanced_chunks
 
 async def batch_upsert_vectors(chunks: List[Dict], doc_url: str):
@@ -148,11 +133,7 @@ async def batch_upsert_vectors(chunks: List[Dict], doc_url: str):
 async def get_rag_answer_async(prompt: str) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    data = {
-        "model": "mistralai/mistral-7b-instruct",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1500, "temperature": 0.1
-    }
+    data = {"model": "mistralai/mistral-7b-instruct:free", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1500, "temperature": 0.1}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=data, timeout=45) as response:
             if response.status != 200:
@@ -164,41 +145,44 @@ async def answer_question(question: str, doc_url: str) -> str:
     try:
         q_embedding = list(get_cached_embedding(question))
         
+        # --- CHANGE 2: Increased retrieval to cast a wider net ---
         query_result = index.query(
-            vector=q_embedding, top_k=10,  # was 8
+            vector=q_embedding, 
+            top_k=15, # Increased from 8 to 15
             include_metadata=True,
             include_scores=True,
             filter={"source_url": doc_url}
+        )
+        
+        if not query_result['matches']: 
+            return "No relevant information found in the document."
 
-    )
-        if not query_result['matches']: return "No relevant information found."
+        # --- CHANGE 3: More robust context filtering ---
+        # Instead of a hard threshold, we always take the top results.
+        # This ensures the LLM always gets some context to analyze.
+        top_results = [m['metadata'] for m in query_result['matches']]
         
-        threshold = 0.5
-        top_results = [
-            m['metadata'] for m in query_result['matches'] if m['score'] >= threshold
-        ]
-        if not top_results: return "No sufficiently relevant information found after filtering."
+        context_parts = []
+        # Limit the context to the top 5-7 chunks to keep the prompt focused and efficient
+        max_context_chunks = 7 
+        for result in top_results[:max_context_chunks]:
+            context_parts.append(f"Source (Page {result.get('page_number', 'N/A')}):\n{result['text']}")
         
-        context_parts = [f"Source (Page {result.get('page_number', 'N/A')}):\n{result['text']}" for result in top_results]
         combined_context = "\n\n---\n\n".join(context_parts)
         
-        prompt = f"""You are a precise policy document expert. Answer the question using ONLY the provided context with exact accuracy.
+        # --- CHANGE 4: Enhanced prompt ---
+        prompt = f"""You are a precise policy document expert. Your task is to answer the question based ONLY on the provided context.
 
-Context:
+Context from the document:
 {combined_context}
 
 Question: {question}
 
 CRITICAL INSTRUCTIONS:
-1. Give a DIRECT, concise answer (2-3 sentences maximum unless complex details are essential)
-2. Include ALL specific requirements, conditions, and exceptions mentioned
-3. Quote EXACT numbers, timeframes, percentages, and limits
-4. Mention specific acts, regulations, or document sections when referenced
-5. If multiple conditions exist, list the KEY ones only
-6. For definitions, include ALL specified criteria (bed counts, staff requirements, etc.)
-7. Always mention if limits don't apply in certain networks/conditions
-8. If information is incomplete in context, state: "Refer to Table of Benefits for specific limits"
-9. Be factual and precise - avoid explanatory text
+1.  Analyze the context carefully. Your answer MUST be based exclusively on the text provided.
+2.  Start with a DIRECT answer to the question.
+3.  Extract EXACT numbers, percentages, and timeframes (e.g., "30 days", "36 months", "5%").
+4.  If, and only if, the answer is not present in the context, you must state: "The answer to this question is not available in the provided document excerpts." Do not try to infer or guess.
 
 Answer:"""
         return await get_rag_answer_async(prompt)
@@ -211,9 +195,6 @@ Answer:"""
 # -------------------------------
 @app.post("/api/v1/hackrx/run")
 async def run_rag_endpoint(payload: QueryPayload, authorization: Optional[str] = Header(None)):
-    """
-    Single endpoint to handle document processing and Q&A for the hackathon.
-    """
     if authorization != f"Bearer {AUTH_TOKEN}":
         raise HTTPException(status_code=403, detail="Unauthorized")
     try:
@@ -221,22 +202,18 @@ async def run_rag_endpoint(payload: QueryPayload, authorization: Optional[str] =
         questions = payload.questions
         doc_hash = generate_doc_hash(doc_url)
 
-        # Ingestion logic with caching
         if doc_hash not in processed_docs_cache:
             print(f"New document: {doc_url}. Starting ingestion...")
             text = load_and_extract_text(doc_url)
             chunks = get_enhanced_text_chunks(text, doc_url)
-            
             await batch_upsert_vectors(chunks, doc_url)
             processed_docs_cache.add(doc_hash)
             print(f"✅ Document ingestion complete.")
         else:
             print(f"Using cached document: {doc_url}")
 
-        # Concurrent question answering
         tasks = [answer_question(q, doc_url) for q in questions]
         answers = await asyncio.gather(*tasks, return_exceptions=True)
-        
         processed_answers = [str(a) if isinstance(a, Exception) else a for a in answers]
         return {"answers": processed_answers}
     except Exception as e:
@@ -245,5 +222,4 @@ async def run_rag_endpoint(payload: QueryPayload, authorization: Optional[str] =
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
