@@ -309,11 +309,3 @@ async def run_rag_endpoint(payload: QueryPayload, authorization: Optional[str] =
         print(f"Error in run_rag_endpoint: {traceback_str}")
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        workers=1,
-        timeout_keep_alive=30
-    )
