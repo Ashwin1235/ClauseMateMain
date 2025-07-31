@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic==1.10.13
+openai
+pinecone
+python-docx
+pypdf
+langchain-text-splitters
+requests
+tiktoken
+python-dotenv  # To load variables from the .env file
